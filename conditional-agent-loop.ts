@@ -78,6 +78,10 @@ async function getAssetPriceUSD(asset: string): Promise<number> {
 }
 
 async function conditionMet(agent: any): Promise<boolean> {
+  if (agent.condition_type === "time_interval") {
+    if (!agent.next_execution_at) return false;
+    return new Date() >= new Date(agent.next_execution_at);
+  }
   const price = await getAssetPriceUSD(agent.condition_asset);
   if (agent.condition_type === "price_below") return price < Number(agent.threshold);
   if (agent.condition_type === "price_above") return price > Number(agent.threshold);
@@ -98,12 +102,14 @@ async function waitForTerminalState(txId: string, maxAttempts = 20): Promise<{ s
 }
 
 async function executeSwap(agent: any) {
-  const token = assetAddress(agent.condition_asset);
+  const isRecurring = agent.condition_type === "time_interval";
+  const asset = isRecurring ? agent.swap_asset : agent.condition_asset; // time_interval rules have no condition_asset, use swap_asset instead
+  const token = assetAddress(asset);
   const tokenToUsdc = agent.swap_direction === "assetToUsdc";
-  const inputDecimals = tokenToUsdc ? assetDecimals(agent.condition_asset) : 6;
+  const inputDecimals = tokenToUsdc ? assetDecimals(asset) : 6;
   const amountInRaw = BigInt(Math.round(Number(agent.swap_amount) * 10 ** inputDecimals));
 
-  console.log(`  Executing swap for ${agent.user_address}: ${agent.swap_amount} ${tokenToUsdc ? agent.condition_asset.toUpperCase() : "USDC"} -> ${tokenToUsdc ? "USDC" : agent.condition_asset.toUpperCase()}`);
+  console.log(`  Executing swap for ${agent.user_address}: ${agent.swap_amount} ${tokenToUsdc ? asset.toUpperCase() : "USDC"} -> ${tokenToUsdc ? "USDC" : asset.toUpperCase()}`);
 
   const quote = (await publicClient.readContract({
     address: POOL_ADDRESS,
@@ -126,15 +132,25 @@ async function executeSwap(agent: any) {
 
   const result = await waitForTerminalState(txId!);
 
-  // This is a one-time conditional order, same as a real stop-loss/take-profit —
-  // it deactivates after this single attempt, whether it succeeds or fails, rather
-  // than repeatedly retrying every cycle while price sits near the threshold.
+  // Price-triggered rules are one-time orders — deactivate after this single
+  // attempt, whether it succeeds or fails. DCA (time_interval) rules are
+  // recurring — on success, they reschedule for the next interval and stay
+  // active; on failure, they still deactivate, since a silently-repeating
+  // failure would just keep burning gas for nothing.
   if (result.state === "COMPLETE" || result.state === "CONFIRMED") {
     console.log(`  Swap confirmed ✓`);
-    await supabase
-      .from("conditional_agents")
-      .update({ active: false, last_triggered_at: new Date().toISOString(), last_error: null })
-      .eq("id", agent.id);
+
+    const update: any = { last_triggered_at: new Date().toISOString(), last_error: null };
+    if (isRecurring) {
+      update.next_execution_at = new Date(Date.now() + agent.interval_days * 24 * 60 * 60 * 1000).toISOString();
+    } else {
+      update.active = false;
+    }
+    await supabase.from("conditional_agents").update(update).eq("id", agent.id);
+
+    const conditionDescription = isRecurring
+      ? `it's been ${agent.interval_days} day(s) since your last DCA execution`
+      : `${asset.toUpperCase()} hit your target price of $${agent.threshold} (${agent.condition_type})`;
 
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
@@ -145,7 +161,7 @@ async function executeSwap(agent: any) {
         },
         {
           role: "user",
-          content: `${agent.condition_asset.toUpperCase()} hit your target price of $${agent.threshold} (${agent.condition_type}), so your agent swapped ${agent.swap_amount} ${tokenToUsdc ? agent.condition_asset.toUpperCase() : "USDC"} to ${tokenToUsdc ? "USDC" : agent.condition_asset.toUpperCase()} on your behalf.`,
+          content: `${conditionDescription}, so your agent swapped ${agent.swap_amount} ${tokenToUsdc ? asset.toUpperCase() : "USDC"} to ${tokenToUsdc ? "USDC" : asset.toUpperCase()} on your behalf.`,
         },
       ],
     });
@@ -178,7 +194,10 @@ async function runCycle() {
   for (const agent of agents) {
     try {
       if (await conditionMet(agent)) {
-        console.log(`  Condition met for agent #${agent.id} (${agent.condition_asset} ${agent.condition_type} $${agent.threshold})`);
+        const description = agent.condition_type === "time_interval"
+          ? `every ${agent.interval_days}d DCA on ${agent.swap_asset}`
+          : `${agent.condition_asset} ${agent.condition_type} $${agent.threshold}`;
+        console.log(`  Condition met for agent #${agent.id} (${description})`);
         await executeSwap(agent);
       }
     } catch (err) {

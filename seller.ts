@@ -2,7 +2,24 @@ import express from "express";
 import cors from "cors";
 import OpenAI from "openai";
 import { createGatewayMiddleware } from "@circle-fin/x402-batching/server";
-import conditionalAgentsRouter from "./conditional-agents-routes";
+import conditionalAgentsRouter, { attachBadDebtRoute } from "./conditional-agents-routes";
+import { createPublicClient, http, defineChain } from "viem";
+import { createClient } from "@supabase/supabase-js";
+
+const arcTestnet = defineChain({
+  id: 5042002,
+  name: "Arc Testnet",
+  nativeCurrency: { name: "USDC", symbol: "USDC", decimals: 18 },
+  rpcUrls: { default: { http: [process.env.RPC_URL || "https://rpc.testnet.arc.network"] } },
+});
+
+const publicClient = createPublicClient({ chain: arcTestnet, transport: http() });
+const supabaseForBadDebt = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
+
+const MINIMAL_VAULT_ABI = [
+  { type: "function", name: "debt", inputs: [{ name: "user", type: "address" }], outputs: [{ type: "uint256" }], stateMutability: "view" },
+  { type: "function", name: "getCollateralValueUSD", inputs: [{ name: "user", type: "address" }], outputs: [{ type: "uint256" }], stateMutability: "view" },
+] as const;
 
 const app = express();
 app.use(
@@ -78,6 +95,7 @@ app.post("/guardian/operating-fee", gateway.require("$0.001"), (req, res) => {
 });
 
 app.use(conditionalAgentsRouter);
+attachBadDebtRoute(app, publicClient, supabaseForBadDebt, process.env.VAULT_ADDRESS!, MINIMAL_VAULT_ABI);
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
@@ -96,4 +114,3 @@ app.use((err: any, req: express.Request, res: express.Response, next: express.Ne
     res.status(500).json({ error: err?.message || "Unknown error", details: String(err) });
   }
 });
-

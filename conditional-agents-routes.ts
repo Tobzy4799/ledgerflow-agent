@@ -6,25 +6,26 @@ const router = express.Router();
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
 const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
 
-const SYSTEM_PROMPT = `You translate a user's plain-English price-triggered swap instruction into a structured autonomous agent rule for Ledgerflow.
+const SYSTEM_PROMPT = `You translate a user's plain-English instruction into a structured autonomous agent rule for Ledgerflow. There are two kinds of rules:
 
-This is for take-profit ("sell EURC when it hits a target price") or buy-the-dip ("buy EURC when it drops to a target price") style automation — always involving EURC or cirBTC against USDC.
+1. PRICE-TRIGGERED (one-time) — take-profit or buy-the-dip, e.g. "sell 10 EURC when it hits $1.20". Fires once, then stops.
+   - conditionType: "price_below" or "price_above"
+   - conditionAsset: "eurc" or "cirbtc"
+   - threshold: the USD price that triggers it
 
-Supported condition types:
-- "price_below": triggers when the asset's price drops below the threshold (typically buy-the-dip)
-- "price_above": triggers when the asset's price rises above the threshold (typically take-profit)
+2. RECURRING (DCA — dollar-cost averaging) — e.g. "buy 20 USDC of EURC every 7 days". Fires repeatedly, forever, until the user deactivates it.
+   - conditionType: "time_interval"
+   - intervalDays: how many days between each execution
+   - swapAsset: "eurc" or "cirbtc" — required for this type, since there's no price condition to imply it
 
-Supported swap directions:
-- "assetToUsdc": sell the asset (EURC/cirBTC) for USDC — typical take-profit
-- "usdcToAsset": buy the asset using USDC — typical buy-the-dip
+Both kinds share:
+- swapDirection: "assetToUsdc" (sell the asset for USDC) or "usdcToAsset" (buy the asset with USDC)
+- swapAmount: a plain decimal string — the amount of whichever token is being SOLD in this swap
 
 Rules:
-- "conditionAsset" must be "eurc" or "cirbtc".
-- "threshold" is always a plain number, the USD price that triggers the swap.
-- "swapAmount" is a plain decimal string — the amount of whichever token is being SOLD in this swap (EURC/cirBTC amount if direction is assetToUsdc, USDC amount if usdcToAsset).
-- If the instruction is ambiguous, missing a number, or doesn't clearly map to a supported condition/direction, return null for "rule" and explain in "clarificationNeeded".
+- If the instruction clearly describes a recurring schedule ("every N days", "weekly", "daily"), treat it as time_interval. If it clearly describes a price target, treat it as price_below/price_above. If ambiguous or missing required fields, return null for "rule" and explain in "clarificationNeeded".
 - Respond with ONLY valid JSON, no other text, matching exactly:
-{ "rule": { "conditionType": "...", "conditionAsset": "...", "threshold": number, "swapDirection": "...", "swapAmount": string } | null, "clarificationNeeded": string | null }`;
+{ "rule": { "conditionType": "...", "conditionAsset": string | null, "threshold": number | null, "intervalDays": number | null, "swapAsset": string | null, "swapDirection": "...", "swapAmount": string } | null, "clarificationNeeded": string | null }`;
 
 router.post("/parse-conditional-agent", async (req, res) => {
   const { instruction } = req.body;
@@ -55,6 +56,9 @@ router.post("/create-conditional-agent", async (req, res) => {
     return res.status(400).json({ error: "Missing userAddress or rule" });
   }
 
+  const isRecurring = rule.conditionType === "time_interval";
+  const nextExecutionAt = isRecurring ? new Date(Date.now() + rule.intervalDays * 24 * 60 * 60 * 1000).toISOString() : null;
+
   const { data, error } = await supabase
     .from("conditional_agents")
     .insert({
@@ -62,6 +66,9 @@ router.post("/create-conditional-agent", async (req, res) => {
       condition_type: rule.conditionType,
       condition_asset: rule.conditionAsset,
       threshold: rule.threshold,
+      interval_days: rule.intervalDays,
+      next_execution_at: nextExecutionAt,
+      swap_asset: rule.swapAsset,
       swap_direction: rule.swapDirection,
       swap_amount: rule.swapAmount,
     })
@@ -90,3 +97,37 @@ router.post("/conditional-agents/:id/deactivate", async (req, res) => {
 });
 
 export default router;
+
+// Separate route module for bad debt reporting, reusing Guardian's existing
+// borrower registry — no new contract state needed, just checks each known
+// borrower's current debt/collateral to sum up genuine bad debt on demand.
+export function attachBadDebtRoute(app: any, publicClient: any, supabase: any, vaultAddress: string, vaultAbi: any) {
+  app.get("/platform/bad-debt", async (req: any, res: any) => {
+    try {
+      const { data: borrowers, error } = await supabase.from("borrowers").select("address");
+      if (error) return res.status(500).json({ error: error.message });
+
+      let totalBadDebt = 0n;
+      const badDebtPositions: { address: string; debt: string }[] = [];
+
+      for (const borrower of borrowers || []) {
+        const [debt, collateralValue] = await Promise.all([
+          publicClient.readContract({ address: vaultAddress, abi: vaultAbi, functionName: "debt", args: [borrower.address] }),
+          publicClient.readContract({ address: vaultAddress, abi: vaultAbi, functionName: "getCollateralValueUSD", args: [borrower.address] }),
+        ]);
+
+        if ((debt as bigint) > 0n && (collateralValue as bigint) === 0n) {
+          totalBadDebt += debt as bigint;
+          badDebtPositions.push({ address: borrower.address, debt: (Number(debt) / 1e6).toFixed(6) });
+        }
+      }
+
+      res.json({
+        totalBadDebtUSD: (Number(totalBadDebt) / 1e6).toFixed(6),
+        positions: badDebtPositions,
+      });
+    } catch (err) {
+      res.status(500).json({ error: (err as Error).message });
+    }
+  });
+}
