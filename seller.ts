@@ -1,7 +1,6 @@
 import express from "express";
 import cors from "cors";
 import OpenAI from "openai";
-import { createGatewayMiddleware } from "@circle-fin/x402-batching/server";
 import conditionalAgentsRouter, { attachBadDebtRoute } from "./conditional-agents-routes";
 import { createPublicClient, http, defineChain } from "viem";
 import { createClient } from "@supabase/supabase-js";
@@ -22,14 +21,7 @@ const MINIMAL_VAULT_ABI = [
 ] as const;
 
 const app = express();
-app.use(
-  cors({
-    origin: "*",
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "PAYMENT-SIGNATURE"],
-    exposedHeaders: ["PAYMENT-REQUIRED"],
-  })
-);
+app.use(cors({ origin: "*", methods: ["GET", "POST", "OPTIONS"], allowedHeaders: ["Content-Type"] }));
 app.use(express.json());
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
@@ -54,15 +46,11 @@ Rules:
 - Respond with ONLY valid JSON, no other text, matching exactly this shape:
 { "actions": [ { "type": "...", ...fields } ], "clarificationNeeded": string | null, "suggestedPrompt": string | null }`;
 
-// This represents the Executor's pay-per-use fee — every time a user asks the
-// Executor to do something, this is the endpoint that charges for it.
-const gateway = createGatewayMiddleware({
-  sellerAddress: process.env.SELLER_WALLET_ADDRESS!,
-  facilitatorUrl: "https://gateway-api-testnet.circle.com",
-  networks: ["eip155:5042002"], // Arc Testnet
-});
-
-app.post("/executor/run-command", gateway.require("$0.001"), async (req, res) => {
+// No payment gating here anymore — the Executor's service fee is now collected
+// on-chain, directly from the user's own wallet, before this route is even
+// called (see the Next.js /api/executor route). This endpoint just does the
+// actual AI parsing.
+app.post("/executor/run-command", async (req, res) => {
   const { prompt } = req.body;
 
   if (!prompt || typeof prompt !== "string") {
@@ -87,24 +75,15 @@ app.post("/executor/run-command", gateway.require("$0.001"), async (req, res) =>
   }
 });
 
-// Guardian's own operating-cost fee — charged once per autonomous check-and-act
-// cycle where it actually takes action (not on every passive check). No OpenAI
-// needed here, just a fee collection point representing the agent's upkeep cost.
-app.post("/guardian/operating-fee", gateway.require("$0.001"), (req, res) => {
-  res.json({ status: "ok", note: "Guardian operating fee collected" });
-});
-
 app.use(conditionalAgentsRouter);
 attachBadDebtRoute(app, publicClient, supabaseForBadDebt, process.env.VAULT_ADDRESS!, MINIMAL_VAULT_ABI);
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`Ledgerflow Executor (paid) running on port ${PORT}`);
-  console.log(`Paywalled route: POST http://localhost:${PORT}/executor/run-command ($0.001, settles on Arc Testnet)`);
+  console.log(`Ledgerflow Executor running on port ${PORT}`);
+  console.log(`Route: POST http://localhost:${PORT}/executor/run-command`);
 });
 
-// Surfaces the REAL underlying error from any middleware (including payment
-// verification) instead of letting it fail silently with just a generic message.
 app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
   console.error("\n=== Full error details ===");
   console.error(err);

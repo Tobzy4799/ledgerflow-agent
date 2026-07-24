@@ -1,17 +1,9 @@
 import { initiateDeveloperControlledWalletsClient } from "@circle-fin/developer-controlled-wallets";
 import { createPublicClient, http, defineChain } from "viem";
 import OpenAI from "openai";
-import { exec } from "child_process";
-import { promisify } from "util";
 import { backfillBorrowers, watchForNewBorrowers, getBorrowers } from "./registry";
 
-const execAsync = promisify(exec);
-
-// The CLI-managed agent wallet used purely for the operating-cost Nanopayment —
-// separate from GUARDIAN_WALLET_ID, which is the Developer-Controlled Wallet
-// that actually performs the protective repay.
-const CLI_AGENT_WALLET_ADDRESS = "0xd8b2b5e08779cbf20303f40b6e952350ffbd26aa";
-const OPERATING_FEE_ENDPOINT = "http://localhost:3001/guardian/operating-fee";
+const TREASURY_ADDRESS = "0xB52Aac9451Ebb70899f3521A16F412f2c9487211"; // where genuine service fees land
 
 // ── Config ──
 const VAULT_ADDRESS = process.env.VAULT_ADDRESS as `0x${string}`;
@@ -160,17 +152,22 @@ async function checkPosition(userAddress: `0x${string}`) {
   console.log(`  Repay submitted: ${response.data?.id} (state: ${response.data?.state})`);
   hasWarned.set(userAddress, false); // reset — if it climbs back up later, warn again first
 
-  // Collect Guardian's own operating-cost Nanopayment for performing this
-  // autonomous check-and-act cycle — same proven mechanism used for the
-  // Executor's pay-per-use fee, just triggered here instead of by a user request.
+  // Collect a small, genuine service fee from the user actually being protected —
+  // real revenue paid by the user, not the platform paying itself. Uses the same
+  // AgentAuth authorization and standing approval already trusted for repayFor,
+  // so no separate signing flow or CLI dependency is needed.
   try {
-    await execAsync(
-      `circle services pay ${OPERATING_FEE_ENDPOINT} -X POST --address ${CLI_AGENT_WALLET_ADDRESS} --chain ARC-TESTNET --max-amount 0.01 --quiet`
-    );
-    console.log(`  Operating fee collected ✓`);
+    const feeResponse = await circleClient.createContractExecutionTransaction({
+      walletId: GUARDIAN_WALLET_ID,
+      contractAddress: VAULT_ADDRESS,
+      abiFunctionSignature: "collectServiceFee(address,uint256,address)",
+      abiParameters: [userAddress, "1000", TREASURY_ADDRESS], // $0.001 fee
+      fee: { type: "level", config: { feeLevel: "MEDIUM" } },
+    });
+    console.log(`  Service fee collected ✓ (${feeResponse.data?.id})`);
   } catch (err) {
     // Fee collection is supplementary — never block the actual protective repay over it.
-    console.error(`  Operating fee collection failed (non-blocking): ${(err as Error).message}`);
+    console.error(`  Service fee collection failed (non-blocking): ${(err as Error).message}`);
   }
 
   try {
