@@ -42,7 +42,7 @@ async function getLastSyncedBlock(): Promise<bigint> {
 }
 
 async function setLastSyncedBlock(block: bigint) {
-  await supabase.from("sync_state").update({ last_synced_block: Number(block) }).eq("id", 1);
+  await supabase.from("sync_state").upsert({ id: 1, last_synced_block: Number(block) });
 }
 
 /// One-time (per startup) historical backfill: catches any Borrowed events that happened
