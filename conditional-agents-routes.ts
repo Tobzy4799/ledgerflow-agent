@@ -13,9 +13,9 @@ const SYSTEM_PROMPT = `You translate a user's plain-English instruction into a s
    - conditionAsset: "eurc" or "cirbtc"
    - threshold: the USD price that triggers it
 
-2. RECURRING (DCA — dollar-cost averaging) — e.g. "buy 20 USDC of EURC every 7 days". Fires repeatedly, forever, until the user deactivates it.
+2. RECURRING (DCA — dollar-cost averaging) — e.g. "buy 20 USDC of EURC every 7 days" or "every 2 minutes" for fast testing. Fires repeatedly, forever, until the user deactivates it.
    - conditionType: "time_interval"
-   - intervalDays: how many days between each execution
+   - intervalMinutes: how many MINUTES between each execution — always convert whatever unit the user said (minutes, hours, or days) into total minutes. E.g. "every 7 days" = 10080, "every 2 minutes" = 2, "every 3 hours" = 180.
    - swapAsset: "eurc" or "cirbtc" — required for this type, since there's no price condition to imply it
 
 Both kinds share:
@@ -24,8 +24,9 @@ Both kinds share:
 
 Rules:
 - If the instruction clearly describes a recurring schedule ("every N days", "weekly", "daily"), treat it as time_interval. If it clearly describes a price target, treat it as price_below/price_above. If ambiguous or missing required fields, return null for "rule" and explain in "clarificationNeeded".
+- Any interval is valid, including very short ones like "every 2 minutes" — this is a real, supported feature (useful for fast testing), not just a real-world DCA strategy tool. Never reject or second-guess a short interval, and never invent a "minimum interval" restriction — none exists. Just convert whatever the user said into total minutes and proceed.
 - Respond with ONLY valid JSON, no other text, matching exactly:
-{ "rule": { "conditionType": "...", "conditionAsset": string | null, "threshold": number | null, "intervalDays": number | null, "swapAsset": string | null, "swapDirection": "...", "swapAmount": string } | null, "clarificationNeeded": string | null }`;
+{ "rule": { "conditionType": "...", "conditionAsset": string | null, "threshold": number | null, "intervalMinutes": number | null, "swapAsset": string | null, "swapDirection": "...", "swapAmount": string } | null, "clarificationNeeded": string | null }`;
 
 router.post("/parse-conditional-agent", async (req, res) => {
   const { instruction } = req.body;
@@ -57,7 +58,7 @@ router.post("/create-conditional-agent", async (req, res) => {
   }
 
   const isRecurring = rule.conditionType === "time_interval";
-  const nextExecutionAt = isRecurring ? new Date(Date.now() + rule.intervalDays * 24 * 60 * 60 * 1000).toISOString() : null;
+  const nextExecutionAt = isRecurring ? new Date(Date.now() + rule.intervalMinutes * 60 * 1000).toISOString() : null;
 
   const { data, error } = await supabase
     .from("conditional_agents")
@@ -66,7 +67,7 @@ router.post("/create-conditional-agent", async (req, res) => {
       condition_type: rule.conditionType,
       condition_asset: rule.conditionAsset,
       threshold: rule.threshold,
-      interval_days: rule.intervalDays,
+      interval_minutes: rule.intervalMinutes,
       next_execution_at: nextExecutionAt,
       swap_asset: rule.swapAsset,
       swap_direction: rule.swapDirection,
@@ -126,6 +127,81 @@ export function attachBadDebtRoute(app: any, publicClient: any, supabase: any, v
         totalBadDebtUSD: (Number(totalBadDebt) / 1e6).toFixed(6),
         positions: badDebtPositions,
       });
+    } catch (err) {
+      res.status(500).json({ error: (err as Error).message });
+    }
+  });
+
+  // Solves a real discoverability gap: users had no way to find WHICH addresses
+  // were actually liquidatable without already knowing them. Scans every known
+  // borrower (same registry Guardian uses) across both collateral assets, and
+  // returns only the positions currently eligible right now.
+  app.get("/platform/liquidatable-positions", async (req: any, res: any) => {
+    try {
+      const { data: borrowers, error } = await supabase.from("borrowers").select("address");
+      if (error) return res.status(500).json({ error: error.message });
+
+      const EURC_ADDRESS = process.env.EURC_ADDRESS!;
+      const CIRBTC_ADDRESS = process.env.CIRBTC_ADDRESS!;
+      const assets = [
+        { address: EURC_ADDRESS, symbol: "EURC" },
+        { address: CIRBTC_ADDRESS, symbol: "cirBTC" },
+      ];
+
+      const positions = [];
+
+      for (const borrower of borrowers || []) {
+        for (const asset of assets) {
+          const info = (await publicClient.readContract({
+            address: vaultAddress,
+            abi: vaultAbi,
+            functionName: "getLiquidationInfo",
+            args: [borrower.address, asset.address],
+          })) as [boolean, bigint, bigint, bigint, boolean];
+
+          const [liquidatable, currentDebt, , , isCritical] = info;
+          if (liquidatable) {
+            positions.push({
+              address: borrower.address,
+              asset: asset.symbol,
+              debt: (Number(currentDebt) / 1e6).toFixed(6),
+              isCritical,
+            });
+          }
+        }
+      }
+
+      res.json({ positions });
+    } catch (err) {
+      res.status(500).json({ error: (err as Error).message });
+    }
+  });
+
+  // Lists every insurance claim ever filed, no log-scanning required — claim IDs
+  // are just sequential integers, so we simply read from 0 up to nextClaimId - 1.
+  app.get("/platform/insurance-claims", async (req: any, res: any) => {
+    try {
+      const insurancePoolAddress = process.env.INSURANCE_POOL_ADDRESS!;
+      const insurancePoolAbi = [
+        { type: "function", name: "nextClaimId", inputs: [], outputs: [{ type: "uint256" }], stateMutability: "view" },
+        { type: "function", name: "claims", inputs: [{ name: "", type: "uint256" }], outputs: [{ name: "user", type: "address" }, { name: "amount", type: "uint256" }, { name: "approved", type: "bool" }, { name: "paid", type: "bool" }], stateMutability: "view" },
+      ] as const;
+
+      const nextClaimId = (await publicClient.readContract({ address: insurancePoolAddress, abi: insurancePoolAbi, functionName: "nextClaimId" })) as bigint;
+
+      const claims = [];
+      for (let i = 0n; i < nextClaimId; i++) {
+        const claim = (await publicClient.readContract({ address: insurancePoolAddress, abi: insurancePoolAbi, functionName: "claims", args: [i] })) as [string, bigint, boolean, boolean];
+        claims.push({
+          id: i.toString(),
+          user: claim[0],
+          amount: (Number(claim[1]) / 1e6).toFixed(6),
+          approved: claim[2],
+          paid: claim[3],
+        });
+      }
+
+      res.json({ claims });
     } catch (err) {
       res.status(500).json({ error: (err as Error).message });
     }

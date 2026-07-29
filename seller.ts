@@ -18,6 +18,7 @@ const supabaseForBadDebt = createClient(process.env.SUPABASE_URL!, process.env.S
 const MINIMAL_VAULT_ABI = [
   { type: "function", name: "debt", inputs: [{ name: "user", type: "address" }], outputs: [{ type: "uint256" }], stateMutability: "view" },
   { type: "function", name: "getCollateralValueUSD", inputs: [{ name: "user", type: "address" }], outputs: [{ type: "uint256" }], stateMutability: "view" },
+  { type: "function", name: "getLiquidationInfo", inputs: [{ name: "user", type: "address" }, { name: "collateralToken", type: "address" }], outputs: [{ name: "liquidatable", type: "bool" }, { name: "currentDebt", type: "uint256" }, { name: "availableCollateral", type: "uint256" }, { name: "maxNormalRepay", type: "uint256" }, { name: "isCritical", type: "bool" }], stateMutability: "view" },
 ] as const;
 
 const app = express();
