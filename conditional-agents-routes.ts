@@ -206,4 +206,19 @@ export function attachBadDebtRoute(app: any, publicClient: any, supabase: any, v
       res.status(500).json({ error: (err as Error).message });
     }
   });
+
+  // Simple platform-wide count for the landing page stats bar - how many
+  // conditional agent rules are currently active, across every user.
+  app.get("/platform/active-agents-count", async (req: any, res: any) => {
+    try {
+      const { count, error } = await supabase
+        .from("conditional_agents")
+        .select("*", { count: "exact", head: true })
+        .eq("active", true);
+      if (error) return res.status(500).json({ error: error.message });
+      res.json({ count: count ?? 0 });
+    } catch (err) {
+      res.status(500).json({ error: (err as Error).message });
+    }
+  });
 }
