@@ -180,6 +180,12 @@ async function executeSwap(agent: any) {
       .from("conditional_agents")
       .update({ active: false, last_triggered_at: new Date().toISOString(), last_error: reason })
       .eq("id", agent.id);
+
+    await sendNotificationEmail(
+      agent.user_address,
+      "Ledgerflow — your rule failed and was deactivated",
+      `Your rule (${isRecurring ? "DCA" : "price-triggered"}, ${agent.swap_amount} ${asset.toUpperCase()}) failed to execute: ${reason}. This is often caused by an insufficient pool approval for the asset being traded. It's been deactivated — check the Conditional Agents page, fix the approval, and recreate it if you'd like to try again.`
+    );
   }
 }
 
