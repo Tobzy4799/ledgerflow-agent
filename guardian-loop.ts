@@ -2,6 +2,7 @@ import { initiateDeveloperControlledWalletsClient } from "@circle-fin/developer-
 import { createPublicClient, http, defineChain } from "viem";
 import OpenAI from "openai";
 import { backfillBorrowers, watchForNewBorrowers, getBorrowers } from "./registry";
+import { sendNotificationEmail } from "./email";
 
 const TREASURY_ADDRESS = "0xB52Aac9451Ebb70899f3521A16F412f2c9487211"; // where genuine service fees land
 
@@ -57,6 +58,19 @@ async function withRetry<T>(fn: () => Promise<T>, retries = 3, delayMs = 1500): 
   }
 }
 
+async function waitForTerminalState(txId: string, maxAttempts = 20): Promise<{ state: string; errorReason?: string }> {
+  const terminalStates = new Set(["COMPLETE", "CONFIRMED", "FAILED", "DENIED", "CANCELLED"]);
+  for (let i = 0; i < maxAttempts; i++) {
+    const { data } = await circleClient.getTransaction({ id: txId });
+    const state = data?.transaction?.state;
+    if (state && terminalStates.has(state)) {
+      return { state, errorReason: data?.transaction?.errorReason };
+    }
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+  }
+  return { state: "TIMEOUT" };
+}
+
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function timestamp() {
@@ -67,6 +81,7 @@ function timestamp() {
 // the same warning every single cycle — only once when crossing into warning territory,
 // resetting once the position recovers back to healthy.
 const hasWarned = new Map<string, boolean>();
+const hasNotifiedFailure = new Map<string, boolean>();
 
 /// One monitoring cycle for a single user. Wrapped in try/catch by the caller so a failure
 /// here (a bad RPC call, an OpenAI hiccup, whatever) never crashes the whole loop — it just
@@ -129,7 +144,11 @@ async function checkPosition(userAddress: `0x${string}`) {
         ],
       });
       console.log(`  ⚠️  Warning: ${warning.choices[0].message.content}`);
-      console.log(`  (In production, this becomes a push notification / email to the user — not a silent log line.)`);
+      await sendNotificationEmail(
+        userAddress,
+        "Ledgerflow — your position needs attention",
+        warning.choices[0].message.content || `Your utilization just crossed ${Number(WARNING_THRESHOLD_BPS) / 100}%.`
+      );
     } catch (err) {
       console.log(`  (couldn't generate warning message this cycle: ${(err as Error).message})`);
     }
@@ -149,7 +168,37 @@ async function checkPosition(userAddress: `0x${string}`) {
     fee: { type: "level", config: { feeLevel: "MEDIUM" } },
   });
 
-  console.log(`  Repay submitted: ${response.data?.id} (state: ${response.data?.state})`);
+  const txId = response.data?.id;
+  console.log(`  Repay submitted: ${txId} — waiting for final on-chain result...`);
+  const result = await waitForTerminalState(txId!);
+
+  if (result.state !== "COMPLETE" && result.state !== "CONFIRMED") {
+    // The repay genuinely did not succeed — most commonly an insufficient
+    // standing approval. Tell the user honestly rather than a false "you're
+    // protected" message, and don't collect a fee for an action that didn't
+    // actually happen. Only notify once per failure episode, not every cycle,
+    // since the position stays in danger zone and will keep retrying.
+    const reason = result.errorReason || `transaction ended in state: ${result.state}`;
+    console.log(`  Repay failed: ${reason}`);
+
+    if (!hasNotifiedFailure.get(userAddress)) {
+      hasNotifiedFailure.set(userAddress, true);
+      await sendNotificationEmail(
+        userAddress,
+        "Ledgerflow — Guardian couldn't protect your position",
+        `Your utilization is at ${utilizationPct}%, above the ${Number(DANGER_THRESHOLD_BPS) / 100}% safety threshold, but Guardian's attempt to repay on your behalf failed (${reason}). This is often caused by an insufficient standing USDC approval — please check this on the Guardian page and consider repaying manually in the meantime.`
+      );
+    }
+    return;
+  }
+
+  console.log(`  Repay confirmed ✓`);
+  hasNotifiedFailure.set(userAddress, false); // reset — if it fails again later, notify again
+  await sendNotificationEmail(
+    userAddress,
+    "Ledgerflow — Guardian just protected your position",
+    `Your utilization crossed ${Number(DANGER_THRESHOLD_BPS) / 100}%, so Guardian automatically repaid ${Number(repayAmount) / 1e6} USDC on your behalf to bring your position back to a safer level.`
+  );
   hasWarned.set(userAddress, false); // reset — if it climbs back up later, warn again first
 
   // Collect a small, genuine service fee from the user actually being protected —

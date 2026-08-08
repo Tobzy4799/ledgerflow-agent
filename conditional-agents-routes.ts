@@ -13,9 +13,9 @@ const SYSTEM_PROMPT = `You translate a user's plain-English instruction into a s
    - conditionAsset: "eurc" or "cirbtc"
    - threshold: the USD price that triggers it
 
-2. RECURRING (DCA — dollar-cost averaging) — e.g. "buy 20 USDC of EURC every 7 days" or "every 2 minutes" for fast testing. Fires repeatedly, forever, until the user deactivates it.
+2. RECURRING (DCA — dollar-cost averaging) — e.g. "buy 20 USDC of EURC every 7 days". Fires repeatedly, forever, until the user deactivates it.
    - conditionType: "time_interval"
-   - intervalMinutes: how many MINUTES between each execution — always convert whatever unit the user said (minutes, hours, or days) into total minutes. E.g. "every 7 days" = 10080, "every 2 minutes" = 2, "every 3 hours" = 180.
+   - intervalDays: how many days between each execution
    - swapAsset: "eurc" or "cirbtc" — required for this type, since there's no price condition to imply it
 
 Both kinds share:
@@ -24,9 +24,8 @@ Both kinds share:
 
 Rules:
 - If the instruction clearly describes a recurring schedule ("every N days", "weekly", "daily"), treat it as time_interval. If it clearly describes a price target, treat it as price_below/price_above. If ambiguous or missing required fields, return null for "rule" and explain in "clarificationNeeded".
-- Any interval is valid, including very short ones like "every 2 minutes" — this is a real, supported feature (useful for fast testing), not just a real-world DCA strategy tool. Never reject or second-guess a short interval, and never invent a "minimum interval" restriction — none exists. Just convert whatever the user said into total minutes and proceed.
 - Respond with ONLY valid JSON, no other text, matching exactly:
-{ "rule": { "conditionType": "...", "conditionAsset": string | null, "threshold": number | null, "intervalMinutes": number | null, "swapAsset": string | null, "swapDirection": "...", "swapAmount": string } | null, "clarificationNeeded": string | null }`;
+{ "rule": { "conditionType": "...", "conditionAsset": string | null, "threshold": number | null, "intervalDays": number | null, "swapAsset": string | null, "swapDirection": "...", "swapAmount": string } | null, "clarificationNeeded": string | null }`;
 
 router.post("/parse-conditional-agent", async (req, res) => {
   const { instruction } = req.body;
@@ -58,7 +57,7 @@ router.post("/create-conditional-agent", async (req, res) => {
   }
 
   const isRecurring = rule.conditionType === "time_interval";
-  const nextExecutionAt = isRecurring ? new Date(Date.now() + rule.intervalMinutes * 60 * 1000).toISOString() : null;
+  const nextExecutionAt = isRecurring ? new Date(Date.now() + rule.intervalDays * 24 * 60 * 60 * 1000).toISOString() : null;
 
   const { data, error } = await supabase
     .from("conditional_agents")
@@ -67,7 +66,7 @@ router.post("/create-conditional-agent", async (req, res) => {
       condition_type: rule.conditionType,
       condition_asset: rule.conditionAsset,
       threshold: rule.threshold,
-      interval_minutes: rule.intervalMinutes,
+      interval_days: rule.intervalDays,
       next_execution_at: nextExecutionAt,
       swap_asset: rule.swapAsset,
       swap_direction: rule.swapDirection,
@@ -220,5 +219,29 @@ export function attachBadDebtRoute(app: any, publicClient: any, supabase: any, v
     } catch (err) {
       res.status(500).json({ error: (err as Error).message });
     }
+  });
+
+  // Lets a user set or update the email used for Guardian warnings and
+  // Conditional Agent execution notifications. One email per wallet address,
+  // shared across both.
+  app.post("/platform/set-email", async (req: any, res: any) => {
+    const { userAddress, email } = req.body;
+    if (!userAddress || !email) return res.status(400).json({ error: "Missing userAddress or email" });
+
+    const { error } = await supabase
+      .from("notification_emails")
+      .upsert({ user_address: userAddress.toLowerCase(), email });
+
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ status: "saved" });
+  });
+
+  app.get("/platform/email/:userAddress", async (req: any, res: any) => {
+    const { data } = await supabase
+      .from("notification_emails")
+      .select("email")
+      .eq("user_address", req.params.userAddress.toLowerCase())
+      .single();
+    res.json({ email: data?.email || null });
   });
 }

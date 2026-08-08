@@ -2,6 +2,7 @@ import { initiateDeveloperControlledWalletsClient } from "@circle-fin/developer-
 import { createPublicClient, http, defineChain } from "viem";
 import { createClient } from "@supabase/supabase-js";
 import OpenAI from "openai";
+import { sendNotificationEmail } from "./email";
 
 const VAULT_ADDRESS = process.env.VAULT_ADDRESS as `0x${string}`;
 const POOL_ADDRESS = process.env.POOL_ADDRESS as `0x${string}`;
@@ -166,6 +167,12 @@ async function executeSwap(agent: any) {
       ],
     });
     console.log(`  Explanation: ${completion.choices[0].message.content}`);
+
+    await sendNotificationEmail(
+      agent.user_address,
+      "Ledgerflow — your rule just fired",
+      completion.choices[0].message.content || `Your rule executed: swapped ${agent.swap_amount} ${tokenToUsdc ? asset.toUpperCase() : "USDC"} to ${tokenToUsdc ? "USDC" : asset.toUpperCase()}.`
+    );
   } else {
     const reason = result.errorReason || `Transaction ended in state: ${result.state}`;
     console.log(`  Swap failed: ${reason}`);
